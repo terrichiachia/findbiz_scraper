@@ -1,0 +1,6 @@
+# 不要把這些東西放到 Git 裡
+company_*.json
+company_data/
+downloads/
+*.ipynb
+scrape_and_print.py
