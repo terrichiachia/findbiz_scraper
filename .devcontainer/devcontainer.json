@@ -5,11 +5,19 @@
         "dockerfile": "../Dockerfile"
     },
     "features": {
-        "ghcr.io/devcontainers/features/github-cli:1": {},
-        "ghcr.io/itsmechlark/features/postgresql:1": {
-            "version": "14",
-            "username": "postgres",
-            "password": "postgres"
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
+    // 使用PostgreSQL作為服務而不是feature
+    "service": {
+        "postgres": {
+            "image": "postgres:14",
+            "environment": {
+                "POSTGRES_USER": "postgres",
+                "POSTGRES_PASSWORD": "postgres",
+                "POSTGRES_DB": "postgres"
+            },
+            "volumes": ["postgres-data:/var/lib/postgresql/data"],
+            "restart": "unless-stopped"
         }
     },
     // 優化 Windows 的文件掛載性能
@@ -21,7 +29,8 @@
         5432,
         8888
     ],
-    "postCreateCommand": "pip install --upgrade pip wheel setuptools jupyter jupyterlab ipykernel ipywidgets matplotlib pandas numpy && pip install -r requirements.txt && sudo apt-get update && sudo apt-get install -y fonts-noto-cjk fonts-noto-cjk-extra fonts-arphic-ukai fonts-arphic-uming fonts-ipafont-mincho fonts-ipafont-gothic fonts-unfonts-core",
+    // 簡化postCreateCommand，因為很多已經在Dockerfile中完成
+    "postCreateCommand": "pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org --default-timeout=1000 -r requirements.txt",
     "customizations": {
         "vscode": {
             "settings": {
@@ -46,13 +55,14 @@
         }
     },
     "remoteEnv": {
-        "DATABASE_URL": "postgresql://postgres:postgres@host.docker.internal:5432/postgres",
+        "DATABASE_URL": "postgresql://postgres:postgres@localhost:5432/postgres",
         "PYTHONPATH": "/workspace",
         "PYTHONUNBUFFERED": "1"
     },
     "runArgs": [
         "--shm-size=2g",
-        "--memory=4g"
+        "--memory=4g",
+        "--network=host"
     ],
     // 添加下载卷
     "mounts": [

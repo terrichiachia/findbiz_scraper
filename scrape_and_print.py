@@ -10,8 +10,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
 from sqlalchemy import create_engine, text
+from datetime import datetime
 
 DB_CONFIG = {
     "dbname": os.environ.get("POSTGRES_DB", "company_data"),
@@ -38,10 +40,9 @@ logging.basicConfig(
 
 def setup_driver():
     """設置 WebDriver，適用於 Docker 環境"""
-    options = webdriver.ChromeOptions()
+    options = Options()
 
     # Docker 環境下的必需選項
-    options.add_argument("--headless")  # Docker 中必須使用無頭模式
     options.add_argument("--no-sandbox")  # 避免沙箱問題
     options.add_argument("--disable-dev-shm-usage")  # 避免共享內存有限問題
     options.add_argument("--disable-gpu")  # 禁用 GPU 硬件加速
@@ -185,8 +186,6 @@ def print_friendly_to_pdf(driver, output_filename):
         return False
 
 
-from sqlalchemy import create_engine, text
-import os, logging
 
 
 def init_database():
@@ -299,22 +298,6 @@ def init_database():
                 )
             )
 
-            # 6. pdf_files
-            conn.execute(
-                text(
-                    """
-            CREATE TABLE IF NOT EXISTS pdf_files (
-                id SERIAL PRIMARY KEY,
-                company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
-                file_name VARCHAR(255),
-                file_path TEXT,
-                file_type VARCHAR(50),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-                )
-            )
-
         logging.info("資料庫表已成功創建或已存在")
         return True
 
@@ -322,8 +305,7 @@ def init_database():
         logging.error(f"初始化資料庫失敗: {e}")
         return False
 
-
-def save_to_database(company_data, registration_number, pdf_path=None):
+def save_to_database(company_data, registration_number):
     """
     用 SQLAlchemy Engine 將公司資料寫入或更新到 PostgreSQL 資料庫。
 
@@ -562,42 +544,9 @@ def save_to_database(company_data, registration_number, pdf_path=None):
                         fv,
                     )
 
-            # 7. PDF 檔案紀錄（pdf_files）
-            if pdf_path:
-                exists = conn.execute(
-                    text(
-                        """
-                    SELECT id FROM pdf_files 
-                     WHERE company_id = :cid AND file_path = :fp
-                """
-                    ),
-                    {"cid": company_id, "fp": pdf_path},
-                ).first()
-
-                if not exists:
-                    pf = {
-                        "company_id": company_id,
-                        "file_name": os.path.basename(pdf_path),
-                        "file_path": pdf_path,
-                        "file_type": "complete_info",
-                    }
-                    conn.execute(
-                        text(
-                            """
-                        INSERT INTO pdf_files (
-                            company_id, file_name, file_path, file_type
-                        ) VALUES (
-                            :company_id, :file_name, :file_path, :file_type
-                        )
-                    """
-                        ),
-                        pf,
-                    )
-
         logging.info(f"已成功將統一編號 {registration_number} 的資料保存到資料庫")
     except Exception as e:
         logging.error(f"保存資料到資料庫時發生錯誤: {e}")
-
 
 def extract_search_result_info(soup):
     """從搜尋結果頁面提取基本資訊"""
@@ -787,13 +736,36 @@ def extract_factory_info(soup):
 
 
 def query_company(registration_number):
+    """
+    查詢單一公司資料
+    
+    Args:
+        registration_number: 公司統一編號
+        
+    Returns:
+        dict 或 None: 公司資料或 None (如果查詢失敗)
+    """
+    # 確認統一編號格式正確
     if not registration_number.isdigit() or len(registration_number) != 8:
-        logging.error("統一編號無效。")
-        return None
-
+        logging.error(f"統一編號 {registration_number} 格式不正確，應為8位數字")
+        return {"查詢結果": "統一編號格式錯誤"}
+    
+    # 檢查統一編號是否合法（簡單檢查，非完整檢查法）
+    weights = [1, 2, 1, 2, 1, 2, 4, 1]
+    checksum = sum(int(registration_number[i]) * weights[i] // 10 + 
+                   int(registration_number[i]) * weights[i] % 10 
+                   for i in range(8)) % 10
+    
+    if checksum != 0:
+        logging.warning(f"統一編號 {registration_number} 可能不是有效的統一編號")
+        # 不中斷程式，因為有些測試用統一編號可能不符合checksum規則
+    
     driver = None
     try:
         driver = setup_driver()
+        if not driver:
+            logging.error("無法設置 WebDriver")
+            return {"查詢結果": "WebDriver 設置失敗"}
 
         # 步驟 1: 前往搜尋頁面
         logging.info("前往網站...")
@@ -812,17 +784,38 @@ def query_company(registration_number):
 
         # 輸入統一編號
         logging.info("等待輸入欄位...")
-        input_el = wait.until(EC.element_to_be_clickable((By.ID, "qryCond")))
-        input_el.clear()
-        input_el.send_keys(registration_number)
+        try:
+            input_el = wait.until(EC.element_to_be_clickable((By.ID, "qryCond")))
+            input_el.clear()
+            input_el.send_keys(registration_number)
+        except TimeoutException:
+            logging.error("無法找到輸入欄位")
+
+            return {"查詢結果": "無法找到輸入欄位"}
 
         # 點擊查詢按鈕
         logging.info("點擊查詢按鈕...")
-        driver.find_element(By.ID, "qryBtn").click()
+        try:
+            search_button = driver.find_element(By.ID, "qryBtn")
+            driver.execute_script("arguments[0].click();", search_button)
+        except NoSuchElementException:
+            logging.error("無法找到查詢按鈕")
+
+            return {"查詢結果": "無法找到查詢按鈕"}
 
         # 等待結果頁面加載
-        logging.info("等待結果面板...")
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".panel-heading")))
+        try:
+            logging.info("等待結果面板...")
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".panel-heading")))
+        except TimeoutException:
+            # 檢查是否顯示「查無資料」的訊息
+            if is_company_not_found(driver):
+                logging.info(f"統一編號 {registration_number} 查無符合資料")
+                return {"查詢結果": "查無符合資料"}
+            
+            logging.error("等待結果面板超時")
+
+            return {"查詢結果": "查詢超時，無結果"}
 
         # 確保頁面完全加載
         time.sleep(2)
@@ -832,6 +825,14 @@ def query_company(registration_number):
         html = driver.page_source
         soup = BeautifulSoup(html, "lxml")
         basic_info = extract_search_result_info(soup)
+        
+        # 檢查是否找到任何基本資訊
+        if not basic_info or len(basic_info) == 0:
+            if is_company_not_found(driver):
+                logging.info(f"統一編號 {registration_number} 查無符合資料")
+                return {"查詢結果": "查無符合資料"}
+            
+            logging.warning("無法從搜尋結果頁提取基本資訊")
 
         # 嘗試多種方法點擊詳細資料連結
         logging.info("尋找詳細資料連結...")
@@ -872,210 +873,317 @@ def query_company(registration_number):
 
         # 等待詳細資料頁面加載
         logging.info("等待詳細資料頁面加載...")
+        detail_page_loaded = False
         try:
             # 等待頁籤加載完成
             wait.until(EC.presence_of_element_located((By.ID, "tabCmpy")))
             time.sleep(2)
+            detail_page_loaded = True
         except TimeoutException:
+            # 檢查是否顯示「查無資料」的訊息
+            if is_company_not_found(driver):
+                logging.info(f"統一編號 {registration_number} 查無符合資料")
+                
             logging.error("無法加載詳細資料頁面，可能頁面結構已更改或網站無回應")
-            # 保存當前頁面以便調試
-            with open("error_page_detail.html", "w", encoding="utf-8") as f:
-                f.write(driver.page_source)
-
             # 如果無法加載詳細資料頁面，則只返回基本資訊
-            return {"基本資料": basic_info}
+            if basic_info and len(basic_info) > 0:
+                return {"查詢結果": "僅獲取基本資訊", "基本資料": basic_info}
+            else:
+                return {"查詢結果": "無法獲取詳細資料"}
 
         # 步驟 4: 提取公司的各種資訊
         company_data = {}
+        company_data["查詢結果"] = "成功"
         company_data["基本資料"] = basic_info  # 保留搜尋結果頁的基本資訊
 
-        # 提取詳細頁的基本資料
-        logging.info("提取公司詳細基本資料...")
-        html = driver.page_source
-        soup = BeautifulSoup(html, "lxml")
-        company_data["詳細基本資料"] = extract_company_base_info(soup)
-
-        # 點擊「董監事資料」頁籤並提取資訊
-        try:
-            logging.info("提取董監事資料...")
-            tab_share_holder = driver.find_element(By.ID, "tabShareHolder")
-            driver.execute_script("arguments[0].click();", tab_share_holder)
-            time.sleep(2)
+        # 只有在成功加載詳細資料頁面後，才繼續提取資訊
+        if detail_page_loaded:
+            # 提取詳細頁的基本資料
+            logging.info("提取公司詳細基本資料...")
             html = driver.page_source
             soup = BeautifulSoup(html, "lxml")
-            company_data["董監事資料"] = extract_shareholder_info(soup)
-        except Exception as e:
-            logging.error(f"提取董監事資料時發生錯誤: {e}")
-            company_data["董監事資料"] = []
+            company_data["詳細基本資料"] = extract_company_base_info(soup)
+            
+            # 檢查詳細基本資料是否為空
+            if not company_data["詳細基本資料"] or len(company_data["詳細基本資料"]) == 0:
+                logging.warning("無法提取詳細基本資料")
+                company_data["查詢結果"] = "詳細資料提取失敗"
+                return company_data
 
-        # 點擊「經理人資料」頁籤並提取資訊
-        try:
-            logging.info("提取經理人資料...")
-            tab_mgr = driver.find_element(By.ID, "tabMgr")
-            driver.execute_script("arguments[0].click();", tab_mgr)
-            time.sleep(2)
-            html = driver.page_source
-            soup = BeautifulSoup(html, "lxml")
-            company_data["經理人資料"] = extract_manager_info(soup)
-        except Exception as e:
-            logging.error(f"提取經理人資料時發生錯誤: {e}")
-            company_data["經理人資料"] = []
+            # 點擊「董監事資料」頁籤並提取資訊
+            try:
+                logging.info("提取董監事資料...")
+                tab_share_holder = driver.find_element(By.ID, "tabShareHolder")
+                driver.execute_script("arguments[0].click();", tab_share_holder)
+                
+                # 等待董監事資料加載
+                try:
+                    wait.until(EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "#tabShareHolderContent table.table")
+                    ))
+                except TimeoutException:
+                    logging.warning("等待董監事資料表格超時")
+                
+                time.sleep(2)
+                html = driver.page_source
+                soup = BeautifulSoup(html, "lxml")
+                company_data["董監事資料"] = extract_shareholder_info(soup)
+            except Exception as e:
+                logging.error(f"提取董監事資料時發生錯誤: {e}")
+                company_data["董監事資料"] = []
 
-        # 點擊「分公司資料」頁籤並提取資訊
-        try:
-            logging.info("提取分公司資料...")
-            tab_br_cmpy = driver.find_element(By.ID, "tabBrCmpy")
-            driver.execute_script("arguments[0].click();", tab_br_cmpy)
-            time.sleep(2)
-            html = driver.page_source
-            soup = BeautifulSoup(html, "lxml")
-            company_data["分公司資料"] = extract_branch_info(soup)
-        except Exception as e:
-            logging.error(f"提取分公司資料時發生錯誤: {e}")
-            company_data["分公司資料"] = []
+            # 點擊「經理人資料」頁籤並提取資訊
+            try:
+                logging.info("提取經理人資料...")
+                tab_mgr = driver.find_element(By.ID, "tabMgr")
+                driver.execute_script("arguments[0].click();", tab_mgr)
+                
+                # 等待經理人資料加載
+                try:
+                    wait.until(EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "#tabMgrContent table.table")
+                    ))
+                except TimeoutException:
+                    logging.warning("等待經理人資料表格超時")
+                
+                time.sleep(2)
+                html = driver.page_source
+                soup = BeautifulSoup(html, "lxml")
+                company_data["經理人資料"] = extract_manager_info(soup)
+            except Exception as e:
+                logging.error(f"提取經理人資料時發生錯誤: {e}")
+                company_data["經理人資料"] = []
 
-        # 點擊「工廠資料」頁籤並提取資訊
-        try:
-            logging.info("提取工廠資料...")
-            tab_factory = driver.find_element(By.ID, "tabFactory")
-            driver.execute_script("arguments[0].click();", tab_factory)
-            time.sleep(2)
-            html = driver.page_source
-            soup = BeautifulSoup(html, "lxml")
-            company_data["工廠資料"] = extract_factory_info(soup)
+            # 點擊「分公司資料」頁籤並提取資訊
+            try:
+                logging.info("提取分公司資料...")
+                tab_br_cmpy = driver.find_element(By.ID, "tabBrCmpy")
+                driver.execute_script("arguments[0].click();", tab_br_cmpy)
+                
+                # 等待分公司資料加載
+                try:
+                    wait.until(EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "#tabBrCmpyContent .table-responsive")
+                    ))
+                except TimeoutException:
+                    logging.warning("等待分公司資料表格超時")
+                
+                time.sleep(2)
+                html = driver.page_source
+                soup = BeautifulSoup(html, "lxml")
+                company_data["分公司資料"] = extract_branch_info(soup)
+            except Exception as e:
+                logging.error(f"提取分公司資料時發生錯誤: {e}")
+                company_data["分公司資料"] = []
 
-            # 頁面可能有分頁，處理下一頁工廠資料
-            logging.info("檢查工廠資料是否有多頁...")
+            # 點擊「工廠資料」頁籤並提取資訊
+            try:
+                logging.info("提取工廠資料...")
+                tab_factory = driver.find_element(By.ID, "tabFactory")
+                driver.execute_script("arguments[0].click();", tab_factory)
+                
+                # 等待工廠資料加載
+                try:
+                    wait.until(EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "#tabFactoryContent .table-responsive")
+                    ))
+                except TimeoutException:
+                    logging.warning("等待工廠資料表格超時")
+                
+                time.sleep(2)
+                html = driver.page_source
+                soup = BeautifulSoup(html, "lxml")
+                company_data["工廠資料"] = extract_factory_info(soup)
 
-            # 更精確地解析分頁資訊
-            pagination = soup.select_one("ul.pagination")
-            if pagination:
-                # 嘗試找到最後一頁的數字
-                last_page_num = 1
+                # 頁面可能有分頁，處理下一頁工廠資料
+                logging.info("檢查工廠資料是否有多頁...")
 
-                # 方法1: 尋找最後一頁链接前的文字 (通常此頁會是最大頁碼)
-                last_page_link = pagination.select_one("li:nth-last-child(2) a")
-                if last_page_link and last_page_link.get_text(strip=True).isdigit():
-                    last_page_num = int(last_page_link.get_text(strip=True))
+                # 更精確地解析分頁資訊
+                pagination = soup.select_one("ul.pagination")
+                if pagination:
+                    # 嘗試找到最後一頁的數字
+                    last_page_num = 1
 
-                # 方法2: 尋找所有數字链接，找出最大的
-                if last_page_num == 1:  # 如果方法1沒找到
-                    for link in pagination.select("li a"):
-                        link_text = link.get_text(strip=True)
-                        if link_text.isdigit():
-                            page_num = int(link_text)
-                            if page_num > last_page_num:
-                                last_page_num = page_num
+                    # 方法1: 尋找最後一頁链接前的文字 (通常此頁會是最大頁碼)
+                    last_page_link = pagination.select_one("li:nth-last-child(2) a")
+                    if last_page_link and last_page_link.get_text(strip=True).isdigit():
+                        last_page_num = int(last_page_link.get_text(strip=True))
 
-                # 方法3: 從分頁信息文字中提取(例如 "共39筆、分2頁")
-                if last_page_num == 1:  # 如果前兩種方法都沒找到
-                    pagination_info = soup.select_one('tr td[colspan="6"]')
-                    if pagination_info:
-                        pagination_text = pagination_info.get_text(strip=True)
-                        match = re.search(r"共\d+筆、分(\d+)頁", pagination_text)
-                        if match:
-                            last_page_num = int(match.group(1))
+                    # 方法2: 尋找所有數字链接，找出最大的
+                    if last_page_num == 1:  # 如果方法1沒找到
+                        for link in pagination.select("li a"):
+                            link_text = link.get_text(strip=True)
+                            if link_text.isdigit():
+                                page_num = int(link_text)
+                                if page_num > last_page_num:
+                                    last_page_num = page_num
 
-                logging.info(f"工廠資料共 {last_page_num} 頁")
+                    # 方法3: 從分頁信息文字中提取(例如 "共39筆、分2頁")
+                    if last_page_num == 1:  # 如果前兩種方法都沒找到
+                        pagination_info = soup.select_one('tr td[colspan="6"]')
+                        if pagination_info:
+                            pagination_text = pagination_info.get_text(strip=True)
+                            match = re.search(r"共\d+筆、分(\d+)頁", pagination_text)
+                            if match:
+                                last_page_num = int(match.group(1))
 
-                # 從第2頁開始處理（第1頁已經處理過）
-                if last_page_num > 1:
-                    for page_num in range(2, last_page_num + 1):
-                        try:
-                            logging.info(f"提取工廠資料第 {page_num} 頁...")
+                    logging.info(f"工廠資料共 {last_page_num} 頁")
 
-                            # 嘗試多種方式點擊頁碼
-                            clicked = False
-
-                            # 方法1: 直接點擊數字頁碼
+                    # 從第2頁開始處理（第1頁已經處理過）
+                    if last_page_num > 1:
+                        for page_num in range(2, last_page_num + 1):
                             try:
-                                page_link = driver.find_element(
-                                    By.XPATH,
-                                    f"//ul[contains(@class, 'pagination')]/li/a[text()='{page_num}']",
-                                )
-                                driver.execute_script(
-                                    "arguments[0].click();", page_link
-                                )
-                                clicked = True
-                            except Exception as e:
-                                logging.warning(
-                                    f"無法通過數字點擊第 {page_num} 頁: {e}"
-                                )
+                                logging.info(f"提取工廠資料第 {page_num} 頁...")
 
-                            # 方法2: 使用 gotoPageFact 函數 (通過 JavaScript 直接調用)
-                            if not clicked:
+                                # 嘗試多種方式點擊頁碼
+                                clicked = False
+
+                                # 方法1: 直接點擊數字頁碼
                                 try:
-                                    logging.info(
-                                        f"嘗試使用 gotoPageFact 函數點擊第 {page_num} 頁..."
+                                    page_link = driver.find_element(
+                                        By.XPATH,
+                                        f"//ul[contains(@class, 'pagination')]/li/a[text()='{page_num}']",
                                     )
-                                    driver.execute_script(f"gotoPageFact({page_num});")
+                                    driver.execute_script(
+                                        "arguments[0].click();", page_link
+                                    )
                                     clicked = True
                                 except Exception as e:
-                                    logging.warning(f"無法使用 gotoPageFact 函數: {e}")
+                                    logging.warning(
+                                        f"無法通過數字點擊第 {page_num} 頁: {e}"
+                                    )
 
-                            if clicked:
-                                # 等待頁面加載
-                                time.sleep(2)
-                                wait.until(
-                                    EC.presence_of_element_located(
-                                        (
-                                            By.CSS_SELECTOR,
-                                            "#tabFactoryContent .table-responsive table.table",
+                                # 方法2: 使用 gotoPageFact 函數 (通過 JavaScript 直接調用)
+                                if not clicked:
+                                    try:
+                                        logging.info(
+                                            f"嘗試使用 gotoPageFact 函數點擊第 {page_num} 頁..."
+                                        )
+                                        driver.execute_script(f"gotoPageFact({page_num});")
+                                        clicked = True
+                                    except Exception as e:
+                                        logging.warning(f"無法使用 gotoPageFact 函數: {e}")
+
+                                if clicked:
+                                    # 等待頁面加載
+                                    time.sleep(2)
+                                    wait.until(
+                                        EC.presence_of_element_located(
+                                            (
+                                                By.CSS_SELECTOR,
+                                                "#tabFactoryContent .table-responsive table.table",
+                                            )
                                         )
                                     )
+
+                                    html = driver.page_source
+                                    soup = BeautifulSoup(html, "lxml")
+                                    additional_factory_info = extract_factory_info(soup)
+                                    company_data["工廠資料"].extend(additional_factory_info)
+                                else:
+                                    logging.error(
+                                        f"無法點擊到第 {page_num} 頁，嘗試了所有可能的方法"
+                                    )
+                                    break
+
+                            except Exception as e:
+                                logging.warning(
+                                    f"提取工廠資料第 {page_num} 頁時發生錯誤: {e}"
                                 )
+                else:
+                    logging.info("工廠資料只有一頁或無分頁導航")
+            except Exception as e:
+                logging.error(f"提取工廠資料時發生錯誤: {e}")
+                company_data["工廠資料"] = []
 
-                                html = driver.page_source
-                                soup = BeautifulSoup(html, "lxml")
-                                additional_factory_info = extract_factory_info(soup)
-                                company_data["工廠資料"].extend(additional_factory_info)
-                            else:
-                                logging.error(
-                                    f"無法點擊到第 {page_num} 頁，嘗試了所有可能的方法"
-                                )
-                                break
-
-                        except Exception as e:
-                            logging.warning(
-                                f"提取工廠資料第 {page_num} 頁時發生錯誤: {e}"
-                            )
-            else:
-                logging.info("工廠資料只有一頁或無分頁導航")
-        except Exception as e:
-            logging.error(f"提取工廠資料時發生錯誤: {e}")
-            company_data["工廠資料"] = []
-
-        # 使用網頁的友善列印功能生成PDF
-        output_dir = create_output_directory(registration_number)
-        pdf_filename = os.path.join(
-            output_dir, f"company_{registration_number}_complete.pdf"
-        )
-        pdf_generated = print_friendly_to_pdf(driver, pdf_filename)
-
-        # 保存資料到資料庫
-        if pdf_generated:
-            save_to_database(company_data, registration_number, pdf_filename)
+            # 使用網頁的友善列印功能生成PDF
+            try:
+                downloads_dir = create_output_directory()  # 不傳入參數，只獲取downloads資料夾路徑
+                pdf_filename = os.path.join(
+                    downloads_dir, f"company_{registration_number}_complete.pdf"
+                )
+                pdf_result = print_friendly_to_pdf(driver, pdf_filename)
+                if pdf_result:
+                    company_data["PDF路徑"] = pdf_filename
+                    logging.info(f"成功生成PDF: {pdf_filename}")
+                else:
+                    logging.warning(f"生成PDF失敗")
+            except Exception as e:
+                logging.error(f"生成PDF時發生錯誤: {e}")
+        
+        # 判斷是否成功獲取到有意義的資料
+        if company_data.get("詳細基本資料") and len(company_data.get("詳細基本資料", {})) > 0:
+            # 保存資料到資料庫
+            try:
+                save_to_database(company_data, registration_number)
+                logging.info(f"統一編號 {registration_number} 的資料已成功保存到資料庫")
+            except Exception as e:
+                logging.error(f"保存資料到資料庫時發生錯誤: {e}")
+                company_data["資料庫保存結果"] = "失敗"
+            
+            # 記錄查詢成功
+            logging.info(f"成功提取統一編號為 {registration_number} 的公司詳細資料")
+            
+            return company_data
         else:
-            save_to_database(company_data, registration_number)
-
-        return company_data
+            if basic_info and len(basic_info) > 0:
+                # 如果只有基本資訊，也返回
+                logging.warning(f"統一編號為 {registration_number} 的公司未獲取到詳細資料")
+                result = {"查詢結果": "僅獲取基本資訊", "基本資料": basic_info}
+                return result
+            else:
+                # 完全無法獲取資料
+                logging.error(f"統一編號為 {registration_number} 的公司完全未獲取到資料")
+                result = {"查詢結果": "無法獲取資料"}
+                return result
 
     except Exception as e:
-        logging.error(f"錯誤: {e}")
-        # 保存頁面內容以便調試
-        if driver:
-            try:
-                html = driver.page_source
-                with open("error_page.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-                logging.info("已將錯誤頁面保存到 error_page.html")
-            except:
-                pass
-        return None
+        logging.error(f"查詢過程中發生未預期錯誤: {e}")
+
+        return {"查詢結果": "發生錯誤", "錯誤訊息": str(e)}
 
     finally:
         if driver:
             driver.quit()
+
+def is_company_not_found(driver):
+    """
+    檢查頁面是否顯示查無符合資料的訊息
+    
+    Args:
+        driver: WebDriver 實例
+        
+    Returns:
+        bool: 是否查無資料
+    """
+    try:
+        page_source = driver.page_source
+        not_found_texts = [
+            "查無符合條件資料",
+            "查無符合查詢條件之公司",
+            "查無資料",
+            "無此統一編號之公司"
+        ]
+        
+        for text in not_found_texts:
+            if text in page_source:
+                return True
+                
+        # 也可以嘗試透過 XPath 或 CSS 選擇器找具體元素
+        try:
+            error_element = driver.find_element(By.XPATH, 
+                "//div[contains(text(), '查無') or contains(text(), '無此統一編號')]")
+            if error_element:
+                return True
+        except NoSuchElementException:
+            pass
+            
+        return False
+    except Exception as e:
+        logging.error(f"檢查是否查無資料時發生錯誤: {e}")
+        return False
+
+
 
 
 def main():
@@ -1084,10 +1192,12 @@ def main():
     """
     try:
         # 初始化資料庫
-        conn = init_database()
-        if not conn:
+        db_initialized = init_database()
+        if not db_initialized:
             logging.error("無法初始化資料庫，程序終止")
             return
+        downloads_dir = create_output_directory()
+        logging.info(f"PDF輸出目錄: {downloads_dir}")
 
         # 查詢台積電
         registration_number = "22099131"
@@ -1114,10 +1224,12 @@ def batch_query_companies(registration_numbers):
     """
     try:
         # 初始化資料庫
-        conn = init_database()
-        if not conn:
+        db_initialized = init_database()
+        if not db_initialized:
             logging.error("無法初始化資料庫，程序終止")
             return
+        downloads_dir = create_output_directory()
+        logging.info(f"PDF輸出目錄: {downloads_dir}")
 
         for registration_number in registration_numbers:
             logging.info(f"開始查詢統一編號為 {registration_number} 的公司資料")
@@ -1150,17 +1262,17 @@ if __name__ == "__main__":
     # 執行單一公司查詢
     # main()
 
-    # 或者批量查詢多家公司
+    # 或者查詢多家公司
     companies_to_query = [
-        "22099131",  # 台積電
-        "04595600",  # 中油
-        "84149786",  # 中華電信
-        "86517384",  # 富邦金控
-        "12345678",  # 錯誤的統編
-        "04793480",  # 統一超商
-        "23757560",  # 全家便利商店
-        "11111111",  # 錯誤的統編
-        "06501701",  # 遠東百貨
-        "83007252",  # 台北捷運
-    ]
+        "22178368", # 微星科技
+        "22099131", # 台灣積體電路製造股份有限公司
+        "84149961", # 聯發科
+        "22555003", # 統一超商
+        "04351626", # 光泉牧場
+        "11768704", # 義美
+        "71620635", # 可果美
+        "03707901", # 中油
+        "73008303", # 大成長城
+        "11111111" # 測試
+        ]
     batch_query_companies(companies_to_query)

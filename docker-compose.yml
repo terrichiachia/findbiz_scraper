@@ -6,7 +6,7 @@ services:
     container_name: postgres
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=1234 # 請更改為你的密碼
+      - POSTGRES_PASSWORD=1234
       - POSTGRES_DB=company_data
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -14,27 +14,39 @@ services:
       - "5432:5432"
     networks:
       - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   scraper:
     build: .
     container_name: scraper
+    shm_size: 2g  # 增加共享內存大小，selenium需要
     environment:
-      - POSTGRES_HOST=postgres # 與服務名稱一致
+      - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=company_data
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=1234 # 請更改為你的密碼
+      - POSTGRES_PASSWORD=1234
+      - PYTHONUNBUFFERED=1
+      # Selenium 相關環境變數
+      - START_XVFB=true
     volumes:
       - ./downloads:/app/downloads
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     networks:
       - app-network
 
+
 volumes:
   pgdata:
-
+    name: findbiz_pgdata
 
 networks:
   app-network:
     driver: bridge
+    name: findbiz_network
